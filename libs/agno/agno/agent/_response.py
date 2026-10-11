@@ -588,6 +588,11 @@ def generate_response_with_output_model(
     if agent.output_model is None:
         return
 
+    # A run pausing for tool confirmation has no answer yet: the output model
+    # would fabricate one before the pending tool call is confirmed and executed.
+    if any(tool_call.is_paused for tool_call in model_response.tool_executions or []):
+        return
+
     messages_for_output_model = get_messages_for_output_model(agent, run_messages.messages)
     output_model_response: ModelResponse = agent.output_model.response(messages=messages_for_output_model)
 
@@ -620,6 +625,11 @@ def generate_response_with_output_model_stream(
     )
 
     if agent.output_model is None:
+        return
+
+    # A run pausing for tool confirmation has no answer yet: the output model
+    # would fabricate one before the pending tool call is confirmed and executed.
+    if any(tool_call.is_paused for tool_call in run_response.tools or []):
         return
 
     if stream_events:
@@ -669,6 +679,11 @@ async def agenerate_response_with_output_model(
     if agent.output_model is None:
         return
 
+    # A run pausing for tool confirmation has no answer yet: the output model
+    # would fabricate one before the pending tool call is confirmed and executed.
+    if any(tool_call.is_paused for tool_call in model_response.tool_executions or []):
+        return
+
     messages_for_output_model = get_messages_for_output_model(agent, run_messages.messages)
     output_model_response: ModelResponse = await agent.output_model.aresponse(messages=messages_for_output_model)
 
@@ -701,6 +716,11 @@ async def agenerate_response_with_output_model_stream(
     )
 
     if agent.output_model is None:
+        return
+
+    # A run pausing for tool confirmation has no answer yet: the output model
+    # would fabricate one before the pending tool call is confirmed and executed.
+    if any(tool_call.is_paused for tool_call in run_response.tools or []):
         return
 
     if stream_events:

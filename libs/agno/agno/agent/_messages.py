@@ -2509,8 +2509,11 @@ def get_messages_for_output_model(agent: Agent, messages: List[Message]) -> List
         if not system_message_exists:
             messages.insert(0, Message(role="system", content=agent.output_model_prompt))
 
-    # Remove the last assistant message from the messages list
-    messages.pop(-1)
+    # Remove the last assistant message from the messages list when it is the
+    # main model's draft answer. The last message is not a draft answer when it
+    # carries a pending tool call or is a tool result — it must be kept.
+    if messages and messages[-1].role == "assistant" and not messages[-1].tool_calls:
+        messages.pop(-1)
 
     return messages
 
