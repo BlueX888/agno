@@ -832,6 +832,8 @@ def _run_stream(
     try:
         # Set up retry logic
         num_attempts = agent.retries + 1
+        # A retried attempt continues the same run, so RunStarted is emitted at most once.
+        run_started_emitted = False
         for attempt in range(num_attempts):
             if attempt > 0:
                 log_debug(f"Retrying Agent run {run_response.run_id}. Attempt {attempt + 1} of {num_attempts}...")
@@ -960,8 +962,10 @@ def _run_stream(
                     run_context=run_context,
                 )
 
-                # Start the Run by yielding a RunStarted event
-                if stream_events:
+                # Start the Run by yielding a RunStarted event. A retry continues the same
+                # run, so the consumer must not see it again.
+                if stream_events and not run_started_emitted:
+                    run_started_emitted = True
                     yield handle_event(  # type: ignore
                         create_run_started_event(run_response),
                         run_response,
@@ -1268,7 +1272,15 @@ def _run_stream(
                     yield run_response
                 break
             except Exception as e:
-                if attempt < num_attempts - 1:
+                # A retry replays the whole run, so it is only safe while nothing has been
+                # streamed. Once output reached the consumer, a retry would append the second
+                # attempt's answer to the first while the RunOutput keeps only the retry's
+                # text. Fail the run instead of leaving the two views inconsistent.
+                if (
+                    attempt < num_attempts - 1
+                    and run_response.content is None
+                    and run_response.reasoning_content is None
+                ):
                     # Calculate delay with exponential backoff if enabled
                     if agent.exponential_backoff:
                         delay = agent.delay_between_retries * (2**attempt)
@@ -1278,6 +1290,12 @@ def _run_stream(
                     log_warning(f"Attempt {attempt + 1}/{num_attempts} failed. Retrying in {delay}s...: {str(e)}")
                     time.sleep(delay)
                     continue
+
+                if attempt < num_attempts - 1:
+                    log_warning(
+                        f"Attempt {attempt + 1}/{num_attempts} failed after output was streamed. Not retrying: "
+                        f"a retry would duplicate the answer already delivered to the consumer. Error: {str(e)}"
+                    )
 
                 run_response.status = RunStatus.error
                 flush_in_flight_messages_on_error(run_response, locals().get("run_messages"))
@@ -1302,6 +1320,9 @@ def _run_stream(
                     )
 
                 yield run_error
+                if yield_run_output:
+                    yield run_response
+                break
     finally:
         # Cancel background futures on error (wait_for_thread_tasks_stream handles waiting on success)
         for future in (memory_future, learning_future):
@@ -2177,6 +2198,8 @@ async def _arun_stream(
 
     # Set up retry logic
     num_attempts = agent.retries + 1
+    # A retried attempt continues the same run, so RunStarted is emitted at most once.
+    run_started_emitted = False
     try:
         for attempt in range(num_attempts):
             if attempt > 0:
@@ -2192,8 +2215,10 @@ async def _arun_stream(
                 else:
                     agent_session = await aread_or_create_session(agent, session_id=session_id, user_id=user_id)
 
-                # Start the Run by yielding a RunStarted event
-                if stream_events:
+                # Start the Run by yielding a RunStarted event. A retry continues the same
+                # run, so the consumer must not see it again.
+                if stream_events and not run_started_emitted:
+                    run_started_emitted = True
                     yield handle_event(  # type: ignore
                         create_run_started_event(run_response),
                         run_response,
@@ -2646,8 +2671,15 @@ async def _arun_stream(
                     yield run_response
                 break
             except Exception as e:
-                # Check if this is the last attempt
-                if attempt < num_attempts - 1:
+                # A retry replays the whole run, so it is only safe while nothing has been
+                # streamed. Once output reached the consumer, a retry would append the second
+                # attempt's answer to the first while the RunOutput keeps only the retry's
+                # text. Fail the run instead of leaving the two views inconsistent.
+                if (
+                    attempt < num_attempts - 1
+                    and run_response.content is None
+                    and run_response.reasoning_content is None
+                ):
                     # Calculate delay with exponential backoff if enabled
                     if agent.exponential_backoff:
                         delay = agent.delay_between_retries * (2**attempt)
@@ -2657,6 +2689,12 @@ async def _arun_stream(
                     log_warning(f"Attempt {attempt + 1}/{num_attempts} failed. Retrying in {delay}s...: {str(e)}")
                     await asyncio.sleep(delay)
                     continue
+
+                if attempt < num_attempts - 1:
+                    log_warning(
+                        f"Attempt {attempt + 1}/{num_attempts} failed after output was streamed. Not retrying: "
+                        f"a retry would duplicate the answer already delivered to the consumer. Error: {str(e)}"
+                    )
 
                 # Handle exceptions during async streaming
                 run_response.status = RunStatus.error
@@ -2683,6 +2721,9 @@ async def _arun_stream(
 
                 # Yield the error event
                 yield run_error
+                if yield_run_output:
+                    yield run_response
+                break
     finally:
         # Always disconnect connectable tools
         disconnect_connectable_tools(agent)
