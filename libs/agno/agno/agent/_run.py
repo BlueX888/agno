@@ -4722,6 +4722,12 @@ async def _acontinue_run(
     # Resolve retry parameters
     try:
         num_attempts = agent.retries + 1
+        # The continuation setup (fork/truncate, dependency resolution and the
+        # caller's `input` append) mutates the run_response carried across
+        # attempts. Run it once, like the sync dispatch does before its retry
+        # loop: re-running it on a retry forks the previous attempt's fork and
+        # appends the same user message twice.
+        run_prepared = False
         for attempt in range(num_attempts):
             try:
                 # Bind run_messages early — cancellation can fire before run_messages
@@ -4774,133 +4780,140 @@ async def _acontinue_run(
                     run_id=run_context.run_id,
                 )
 
-                # 4. Prepare run response
-                if run_response is not None:
-                    if run_response.status == RunStatus.cancelled:
-                        raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
-                    # The run is continued from a provided run_response. This contains the updated tools.
-                    # The pipeline completes this object in place: the caller owns it
-                    # (the run getters hand out copies, and the team resume flow relies
-                    # on its member run completing in place).
-                    continue_index: Optional[int] = _resolve_continue_from(
-                        run_response,
-                        continue_from=continue_from,
-                        regenerate=regenerate,
-                    )
-                    fork, continue_index, input = _normalize_regenerate_params(
-                        run_response,
-                        regenerate=regenerate,
-                        replace_original=replace_original,
-                        additional_instructions=additional_instructions,
-                        fork=fork,
-                        continue_index=continue_index,
-                        input=input,
-                    )
-                    if not fork and run_response.status == RunStatus.completed:
-                        fork = True
-                    original_run_id_for_lineage = run_response.run_id if regenerate else None
-                    run_response = _apply_continue_modifiers(run_response, fork, continue_index)
-                    if regenerate and original_run_id_for_lineage:
-                        run_response.regenerated_from = original_run_id_for_lineage
-                        if replace_original is not False and run_response.forked_from_run_id:
-                            await _amark_run_regenerated(agent, agent_session, original_run_id_for_lineage)
-                    input_messages = run_response.messages or []
-                elif run_id is not None:
-                    # The run is continued from a run_id.
-                    run_response = cast(Optional[RunOutput], dependency_run)
-                    if run_response is None:
-                        raise RunNotFoundError(f"No runs found for run ID {run_id}")
-                    if run_response.status == RunStatus.cancelled:
-                        raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
-                    # The continued run is mutated through the whole continue
-                    # pipeline (message truncation, tool results, status).
-                    # History run objects are shared between reads of the same
-                    # session, so continue works on its own copy.
-                    from copy import deepcopy as _deepcopy_run
-
-                    run_response = _deepcopy_run(run_response)
-
-                    continue_index = _resolve_continue_from(
-                        run_response,
-                        continue_from=continue_from,
-                        regenerate=regenerate,
-                    )
-                    fork, continue_index, input = _normalize_regenerate_params(
-                        run_response,
-                        regenerate=regenerate,
-                        replace_original=replace_original,
-                        additional_instructions=additional_instructions,
-                        fork=fork,
-                        continue_index=continue_index,
-                        input=input,
-                    )
-                    original_run_id_for_lineage = run_response.run_id if regenerate else None
-
-                    # Auto-fork on COMPLETED — preserves the "1 run = 1 model loop"
-                    # invariant. Continuing a run whose model loop already
-                    # completed MUST produce a new run_id; otherwise the
-                    # persisted row would mix two loops' metrics. The only
-                    # in-place resumes are mid-flight ones (RUNNING / ERROR /
-                    # PAUSED — the loop never actually finished).
-                    if not fork and run_response.status == RunStatus.completed:
-                        fork = True
-
-                    # Apply fork/truncate before validation so the rest of the dispatch operates
-                    # on the modified state. The local ``run_id`` continues to refer to the
-                    # original run (used for HITL approval lookups); ``run_response.run_id``
-                    # is the new UUID when fork=True.
-                    run_response = _apply_continue_modifiers(run_response, fork, continue_index)
-                    if regenerate and original_run_id_for_lineage:
-                        run_response.regenerated_from = original_run_id_for_lineage
-                        if replace_original is not False and run_response.forked_from_run_id:
-                            await _amark_run_regenerated(agent, agent_session, original_run_id_for_lineage)
-
-                    input_messages = run_response.messages or []
-
-                    # If we have requirements, get the updated tools and set them in the run_response
-                    if requirements is not None:
-                        _apply_requirement_tools(run_response, requirements)
-
-                    else:
-                        # No tools / requirements in the body. Two cases:
-                        # 1. The run has unresolved HITL requirements → try admin-approval
-                        #    resolution; if none, the caller must provide tools/requirements.
-                        # 2. The run has no unresolved requirements → just resume from current
-                        #    state (mid-flight resume, ERROR retry, time-travel, etc.). This
-                        #    is the unified /continue path (ADR-003, ADR-004).
-                        has_unresolved_requirements = any(
-                            not req.is_resolved() for req in (run_response.requirements or [])
+                # 4. Prepare run response. The fork/truncate step and the
+                # caller's input append mutate the run_response carried across
+                # attempts. Prepare once, not once per retry: replaying them on
+                # attempt 2 forks attempt 1's ephemeral fork and appends the
+                # same user instruction a second time (the sync dispatch
+                # prepares once before its retry loop).
+                if not run_prepared:
+                    if run_response is not None:
+                        if run_response.status == RunStatus.cancelled:
+                            raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
+                        # The run is continued from a provided run_response. This contains the updated tools.
+                        # The pipeline completes this object in place: the caller owns it
+                        # (the run getters hand out copies, and the team resume flow relies
+                        # on its member run completing in place).
+                        continue_index: Optional[int] = _resolve_continue_from(
+                            run_response,
+                            continue_from=continue_from,
+                            regenerate=regenerate,
                         )
-                        if has_unresolved_requirements:
-                            from agno.run.approval import acheck_and_apply_approval_resolution
+                        fork, continue_index, input = _normalize_regenerate_params(
+                            run_response,
+                            regenerate=regenerate,
+                            replace_original=replace_original,
+                            additional_instructions=additional_instructions,
+                            fork=fork,
+                            continue_index=continue_index,
+                            input=input,
+                        )
+                        if not fork and run_response.status == RunStatus.completed:
+                            fork = True
+                        original_run_id_for_lineage = run_response.run_id if regenerate else None
+                        run_response = _apply_continue_modifiers(run_response, fork, continue_index)
+                        if regenerate and original_run_id_for_lineage:
+                            run_response.regenerated_from = original_run_id_for_lineage
+                            if replace_original is not False and run_response.forked_from_run_id:
+                                await _amark_run_regenerated(agent, agent_session, original_run_id_for_lineage)
+                        input_messages = run_response.messages or []
+                    elif run_id is not None:
+                        # The run is continued from a run_id.
+                        run_response = cast(Optional[RunOutput], dependency_run)
+                        if run_response is None:
+                            raise RunNotFoundError(f"No runs found for run ID {run_id}")
+                        if run_response.status == RunStatus.cancelled:
+                            raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
+                        # The continued run is mutated through the whole continue
+                        # pipeline (message truncation, tool results, status).
+                        # History run objects are shared between reads of the same
+                        # session, so continue works on its own copy.
+                        from copy import deepcopy as _deepcopy_run
 
-                            try:
-                                # This will apply resolution_data to tools if approval is resolved
-                                await acheck_and_apply_approval_resolution(agent.db, run_id, run_response)
-                            except RuntimeError:
-                                # No resolved approval found — caller must provide requirements/tools
-                                raise ValueError(
-                                    "Run has unresolved HITL requirements. Provide the `requirements` "
-                                    "parameter (or resolve an admin approval first)."
-                                )
-                        # else: nothing to resolve — fall through to resume from current state
-                else:
-                    raise ValueError("Either run_response or run_id must be provided.")
+                        run_response = _deepcopy_run(run_response)
 
-                # If the caller supplied a new user-message string (unified /continue
-                # body field ``input``), append it to run_response.messages before
-                # building run_messages.
-                if run_context.dependencies is not None:
-                    await aresolve_run_dependencies(
-                        agent,
-                        run_context=run_context,
-                        run_input=dependency_run.input if isinstance(dependency_run, RunOutput) else None,
-                        session=agent_session,
-                    )
+                        continue_index = _resolve_continue_from(
+                            run_response,
+                            continue_from=continue_from,
+                            regenerate=regenerate,
+                        )
+                        fork, continue_index, input = _normalize_regenerate_params(
+                            run_response,
+                            regenerate=regenerate,
+                            replace_original=replace_original,
+                            additional_instructions=additional_instructions,
+                            fork=fork,
+                            continue_index=continue_index,
+                            input=input,
+                        )
+                        original_run_id_for_lineage = run_response.run_id if regenerate else None
 
-                if input:
-                    _maybe_append_input_message(run_response, input, agent)
-                    input_messages = run_response.messages or []
+                        # Auto-fork on COMPLETED — preserves the "1 run = 1 model loop"
+                        # invariant. Continuing a run whose model loop already
+                        # completed MUST produce a new run_id; otherwise the
+                        # persisted row would mix two loops' metrics. The only
+                        # in-place resumes are mid-flight ones (RUNNING / ERROR /
+                        # PAUSED — the loop never actually finished).
+                        if not fork and run_response.status == RunStatus.completed:
+                            fork = True
+
+                        # Apply fork/truncate before validation so the rest of the dispatch operates
+                        # on the modified state. The local ``run_id`` continues to refer to the
+                        # original run (used for HITL approval lookups); ``run_response.run_id``
+                        # is the new UUID when fork=True.
+                        run_response = _apply_continue_modifiers(run_response, fork, continue_index)
+                        if regenerate and original_run_id_for_lineage:
+                            run_response.regenerated_from = original_run_id_for_lineage
+                            if replace_original is not False and run_response.forked_from_run_id:
+                                await _amark_run_regenerated(agent, agent_session, original_run_id_for_lineage)
+
+                        input_messages = run_response.messages or []
+
+                        # If we have requirements, get the updated tools and set them in the run_response
+                        if requirements is not None:
+                            _apply_requirement_tools(run_response, requirements)
+
+                        else:
+                            # No tools / requirements in the body. Two cases:
+                            # 1. The run has unresolved HITL requirements → try admin-approval
+                            #    resolution; if none, the caller must provide tools/requirements.
+                            # 2. The run has no unresolved requirements → just resume from current
+                            #    state (mid-flight resume, ERROR retry, time-travel, etc.). This
+                            #    is the unified /continue path (ADR-003, ADR-004).
+                            has_unresolved_requirements = any(
+                                not req.is_resolved() for req in (run_response.requirements or [])
+                            )
+                            if has_unresolved_requirements:
+                                from agno.run.approval import acheck_and_apply_approval_resolution
+
+                                try:
+                                    # This will apply resolution_data to tools if approval is resolved
+                                    await acheck_and_apply_approval_resolution(agent.db, run_id, run_response)
+                                except RuntimeError:
+                                    # No resolved approval found — caller must provide requirements/tools
+                                    raise ValueError(
+                                        "Run has unresolved HITL requirements. Provide the `requirements` "
+                                        "parameter (or resolve an admin approval first)."
+                                    )
+                            # else: nothing to resolve — fall through to resume from current state
+                    else:
+                        raise ValueError("Either run_response or run_id must be provided.")
+
+                    # If the caller supplied a new user-message string (unified /continue
+                    # body field ``input``), append it to run_response.messages before
+                    # building run_messages.
+                    if run_context.dependencies is not None:
+                        await aresolve_run_dependencies(
+                            agent,
+                            run_context=run_context,
+                            run_input=dependency_run.input if isinstance(dependency_run, RunOutput) else None,
+                            session=agent_session,
+                        )
+
+                    if input:
+                        _maybe_append_input_message(run_response, input, agent)
+                        input_messages = run_response.messages or []
+                    run_prepared = True
 
                 run_response = cast(RunOutput, run_response)
 
@@ -5243,6 +5256,12 @@ async def _acontinue_run_stream(
     # Resolve retry parameters
     try:
         num_attempts = agent.retries + 1
+        # The continuation setup (fork/truncate, dependency resolution and the
+        # caller's `input` append) mutates the run_response carried across
+        # attempts. Run it once, like the sync dispatch does before its retry
+        # loop: re-running it on a retry forks the previous attempt's fork and
+        # appends the same user message twice.
+        run_prepared = False
         for attempt in range(num_attempts):
             try:
                 # Bind run_messages early — cancellation can fire before run_messages
@@ -5292,134 +5311,141 @@ async def _acontinue_run_stream(
 
                 # 3. Resolve dependencies
 
-                # 4. Prepare run response
-                if run_response is not None:
-                    if run_response.status == RunStatus.cancelled:
-                        raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
-                    # The run is continued from a provided run_response. This contains the updated tools.
-                    # The pipeline completes this object in place: the caller owns it
-                    # (the run getters hand out copies, and the team resume flow relies
-                    # on its member run completing in place).
-                    continue_index: Optional[int] = _resolve_continue_from(
-                        run_response,
-                        continue_from=continue_from,
-                        regenerate=regenerate,
-                    )
-                    fork, continue_index, input = _normalize_regenerate_params(
-                        run_response,
-                        regenerate=regenerate,
-                        replace_original=replace_original,
-                        additional_instructions=additional_instructions,
-                        fork=fork,
-                        continue_index=continue_index,
-                        input=input,
-                    )
-                    if not fork and run_response.status == RunStatus.completed:
-                        fork = True
-                    original_run_id_for_lineage = run_response.run_id if regenerate else None
-                    run_response = _apply_continue_modifiers(run_response, fork, continue_index)
-                    if regenerate and original_run_id_for_lineage:
-                        run_response.regenerated_from = original_run_id_for_lineage
-                        if replace_original is not False and run_response.forked_from_run_id:
-                            await _amark_run_regenerated(agent, agent_session, original_run_id_for_lineage)
-                    input_messages = run_response.messages or []
-
-                elif run_id is not None:
-                    # The run is continued from a run_id.
-                    run_response = cast(Optional[RunOutput], dependency_run)
-                    if run_response is None:
-                        raise RunNotFoundError(f"No runs found for run ID {run_id}")
-                    if run_response.status == RunStatus.cancelled:
-                        raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
-                    # The continued run is mutated through the whole continue
-                    # pipeline (message truncation, tool results, status).
-                    # History run objects are shared between reads of the same
-                    # session, so continue works on its own copy.
-                    from copy import deepcopy as _deepcopy_run
-
-                    run_response = _deepcopy_run(run_response)
-
-                    continue_index = _resolve_continue_from(
-                        run_response,
-                        continue_from=continue_from,
-                        regenerate=regenerate,
-                    )
-                    fork, continue_index, input = _normalize_regenerate_params(
-                        run_response,
-                        regenerate=regenerate,
-                        replace_original=replace_original,
-                        additional_instructions=additional_instructions,
-                        fork=fork,
-                        continue_index=continue_index,
-                        input=input,
-                    )
-                    original_run_id_for_lineage = run_response.run_id if regenerate else None
-
-                    # Auto-fork on COMPLETED — preserves the "1 run = 1 model loop"
-                    # invariant. Continuing a run whose model loop already
-                    # completed MUST produce a new run_id; otherwise the
-                    # persisted row would mix two loops' metrics. The only
-                    # in-place resumes are mid-flight ones (RUNNING / ERROR /
-                    # PAUSED — the loop never actually finished).
-                    if not fork and run_response.status == RunStatus.completed:
-                        fork = True
-
-                    # Apply fork/truncate before validation so the rest of the dispatch operates
-                    # on the modified state. The local ``run_id`` continues to refer to the
-                    # original run (used for HITL approval lookups); ``run_response.run_id``
-                    # is the new UUID when fork=True.
-                    run_response = _apply_continue_modifiers(run_response, fork, continue_index)
-                    if regenerate and original_run_id_for_lineage:
-                        run_response.regenerated_from = original_run_id_for_lineage
-                        if replace_original is not False and run_response.forked_from_run_id:
-                            await _amark_run_regenerated(agent, agent_session, original_run_id_for_lineage)
-
-                    input_messages = run_response.messages or []
-
-                    # If we have requirements, get the updated tools and set them in the run_response
-                    if requirements is not None:
-                        _apply_requirement_tools(run_response, requirements)
-
-                    else:
-                        # No tools / requirements in the body. Two cases:
-                        # 1. The run has unresolved HITL requirements → try admin-approval
-                        #    resolution; if none, the caller must provide tools/requirements.
-                        # 2. The run has no unresolved requirements → just resume from current
-                        #    state (ERROR retry, time-travel, etc.). This is the unified
-                        #    /continue path (ADR-003, ADR-004).
-                        has_unresolved_requirements = any(
-                            not req.is_resolved() for req in (run_response.requirements or [])
+                # 4. Prepare run response. The fork/truncate step and the
+                # caller's input append mutate the run_response carried across
+                # attempts. Prepare once, not once per retry: replaying them on
+                # attempt 2 forks attempt 1's ephemeral fork and appends the
+                # same user instruction a second time (the sync dispatch
+                # prepares once before its retry loop).
+                if not run_prepared:
+                    if run_response is not None:
+                        if run_response.status == RunStatus.cancelled:
+                            raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
+                        # The run is continued from a provided run_response. This contains the updated tools.
+                        # The pipeline completes this object in place: the caller owns it
+                        # (the run getters hand out copies, and the team resume flow relies
+                        # on its member run completing in place).
+                        continue_index: Optional[int] = _resolve_continue_from(
+                            run_response,
+                            continue_from=continue_from,
+                            regenerate=regenerate,
                         )
-                        if has_unresolved_requirements:
-                            from agno.run.approval import acheck_and_apply_approval_resolution
+                        fork, continue_index, input = _normalize_regenerate_params(
+                            run_response,
+                            regenerate=regenerate,
+                            replace_original=replace_original,
+                            additional_instructions=additional_instructions,
+                            fork=fork,
+                            continue_index=continue_index,
+                            input=input,
+                        )
+                        if not fork and run_response.status == RunStatus.completed:
+                            fork = True
+                        original_run_id_for_lineage = run_response.run_id if regenerate else None
+                        run_response = _apply_continue_modifiers(run_response, fork, continue_index)
+                        if regenerate and original_run_id_for_lineage:
+                            run_response.regenerated_from = original_run_id_for_lineage
+                            if replace_original is not False and run_response.forked_from_run_id:
+                                await _amark_run_regenerated(agent, agent_session, original_run_id_for_lineage)
+                        input_messages = run_response.messages or []
 
-                            try:
-                                # This will apply resolution_data to tools if approval is resolved
-                                await acheck_and_apply_approval_resolution(agent.db, run_id, run_response)
-                            except RuntimeError:
-                                # No resolved approval found — caller must provide requirements/tools
-                                raise ValueError(
-                                    "Run has unresolved HITL requirements. Provide the `requirements` "
-                                    "parameter (or resolve an admin approval first)."
-                                )
-                        # else: nothing to resolve — fall through to resume from current state
-                else:
-                    raise ValueError("Either run_response or run_id must be provided.")
+                    elif run_id is not None:
+                        # The run is continued from a run_id.
+                        run_response = cast(Optional[RunOutput], dependency_run)
+                        if run_response is None:
+                            raise RunNotFoundError(f"No runs found for run ID {run_id}")
+                        if run_response.status == RunStatus.cancelled:
+                            raise RunNotContinuableError(f"Cannot continue run {run_response.run_id}: run is cancelled")
+                        # The continued run is mutated through the whole continue
+                        # pipeline (message truncation, tool results, status).
+                        # History run objects are shared between reads of the same
+                        # session, so continue works on its own copy.
+                        from copy import deepcopy as _deepcopy_run
 
-                # If the caller supplied a new user-message string (unified /continue
-                # body field ``input``), append it to run_response.messages before
-                # building run_messages.
-                if run_context.dependencies is not None:
-                    await aresolve_run_dependencies(
-                        agent,
-                        run_context=run_context,
-                        run_input=dependency_run.input if isinstance(dependency_run, RunOutput) else None,
-                        session=agent_session,
-                    )
+                        run_response = _deepcopy_run(run_response)
 
-                if input:
-                    _maybe_append_input_message(run_response, input, agent)
-                    input_messages = run_response.messages or []
+                        continue_index = _resolve_continue_from(
+                            run_response,
+                            continue_from=continue_from,
+                            regenerate=regenerate,
+                        )
+                        fork, continue_index, input = _normalize_regenerate_params(
+                            run_response,
+                            regenerate=regenerate,
+                            replace_original=replace_original,
+                            additional_instructions=additional_instructions,
+                            fork=fork,
+                            continue_index=continue_index,
+                            input=input,
+                        )
+                        original_run_id_for_lineage = run_response.run_id if regenerate else None
+
+                        # Auto-fork on COMPLETED — preserves the "1 run = 1 model loop"
+                        # invariant. Continuing a run whose model loop already
+                        # completed MUST produce a new run_id; otherwise the
+                        # persisted row would mix two loops' metrics. The only
+                        # in-place resumes are mid-flight ones (RUNNING / ERROR /
+                        # PAUSED — the loop never actually finished).
+                        if not fork and run_response.status == RunStatus.completed:
+                            fork = True
+
+                        # Apply fork/truncate before validation so the rest of the dispatch operates
+                        # on the modified state. The local ``run_id`` continues to refer to the
+                        # original run (used for HITL approval lookups); ``run_response.run_id``
+                        # is the new UUID when fork=True.
+                        run_response = _apply_continue_modifiers(run_response, fork, continue_index)
+                        if regenerate and original_run_id_for_lineage:
+                            run_response.regenerated_from = original_run_id_for_lineage
+                            if replace_original is not False and run_response.forked_from_run_id:
+                                await _amark_run_regenerated(agent, agent_session, original_run_id_for_lineage)
+
+                        input_messages = run_response.messages or []
+
+                        # If we have requirements, get the updated tools and set them in the run_response
+                        if requirements is not None:
+                            _apply_requirement_tools(run_response, requirements)
+
+                        else:
+                            # No tools / requirements in the body. Two cases:
+                            # 1. The run has unresolved HITL requirements → try admin-approval
+                            #    resolution; if none, the caller must provide tools/requirements.
+                            # 2. The run has no unresolved requirements → just resume from current
+                            #    state (ERROR retry, time-travel, etc.). This is the unified
+                            #    /continue path (ADR-003, ADR-004).
+                            has_unresolved_requirements = any(
+                                not req.is_resolved() for req in (run_response.requirements or [])
+                            )
+                            if has_unresolved_requirements:
+                                from agno.run.approval import acheck_and_apply_approval_resolution
+
+                                try:
+                                    # This will apply resolution_data to tools if approval is resolved
+                                    await acheck_and_apply_approval_resolution(agent.db, run_id, run_response)
+                                except RuntimeError:
+                                    # No resolved approval found — caller must provide requirements/tools
+                                    raise ValueError(
+                                        "Run has unresolved HITL requirements. Provide the `requirements` "
+                                        "parameter (or resolve an admin approval first)."
+                                    )
+                            # else: nothing to resolve — fall through to resume from current state
+                    else:
+                        raise ValueError("Either run_response or run_id must be provided.")
+
+                    # If the caller supplied a new user-message string (unified /continue
+                    # body field ``input``), append it to run_response.messages before
+                    # building run_messages.
+                    if run_context.dependencies is not None:
+                        await aresolve_run_dependencies(
+                            agent,
+                            run_context=run_context,
+                            run_input=dependency_run.input if isinstance(dependency_run, RunOutput) else None,
+                            session=agent_session,
+                        )
+
+                    if input:
+                        _maybe_append_input_message(run_response, input, agent)
+                        input_messages = run_response.messages or []
+                    run_prepared = True
 
                 run_response = cast(RunOutput, run_response)
 
